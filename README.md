@@ -1,6 +1,6 @@
 Information for humans only: 
 
-These coding instructions are based on my coding guidlines:
+These coding instructions for universal-approximation-theorem-based copilots originate in my F# coding guidlines:
 https://github.com/MiroslavHustak/FSharp-Coding-Guidelines
 
 
