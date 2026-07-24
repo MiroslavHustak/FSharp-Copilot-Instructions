@@ -4,6 +4,7 @@ These coding instructions for universal-approximation-theorem-based copilots ori
 https://github.com/MiroslavHustak/FSharp-Coding-Guidelines
 
 
+
 # F# Copilot Instructions
 
 --
