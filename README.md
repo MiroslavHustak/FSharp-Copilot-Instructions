@@ -64,15 +64,50 @@ https://github.com/MiroslavHustak/FSharp-Coding-Guidelines
   Also guard against division by zero and other operations that throw on valid-looking input. If you believe a partial function is genuinely safe in a particular place, do not use it silently: either restructure so it is not needed, or add a comment stating why it cannot throw (compare §9).
 - **Keep the combinator vocabulary small.** When composing without a CE, prefer: `Option.map/bind/iter`, `Result.map/bind`, `Option.defaultValue`, `Option.orElseWith`, `Option.toResult`, `Result.defaultWith`, `Result.defaultValue`, `Result.sequence`, `Result.either`, `Result.mapError`.
 - **Custom CEs:** `Bind` must satisfy the monad laws. If it deliberately breaks them, use an alias to avoid confusion.
-- **Exceptions are converted at the boundary.** Any .NET/Android API that can throw or return null gets wrapped immediately. The exception or null must not leak past the first function that calls into the framework.
+- **Exceptions are converted to `Result` at the boundary.** Any .NET/Android API that can throw or return null gets wrapped immediately: the exception becomes a `Result` (`Error`), the null becomes an `Option` (`None`). The exception or null must not leak past the first function that calls into the framework. Such a function is impure, so its return type is wrapped in `Impure` (§4).
   ```fsharp
+  let private startActivity (activity : Activity) (intent : Intent) : Impure<Result<unit, ActivityError>> =
+
+      Impure (fun () ->
+
+          try
+              activity.StartActivityForResult(intent, REQUEST_CODE) |> Ok
+          with
+          | ex -> Error (StartActivityFailed ex.Message)
+      )
+  ```
+  (`ActivityError` and `StartActivityFailed` are placeholder names; use the project's own error type.)
+
+  `try/with` at an interop boundary is correct and expected. It is not a violation of "no exception-based flow." The violation would be letting that exception propagate as control flow *into* pure application code instead of converting it to a `Result`/`Option` at the seam.
+- **`Task` bridges (the only exception to the rule above).** Where a `Task` is unavoidable (e.g. an Android callback, with the code that starts the operation and the code that awaits its outcome in different places), `TaskCompletionSource.TrySetException` may carry the failure across. It is only a bridge, never the final handling: the exception is still an exception until it is converted to a `Result` at the point where the `Task` is consumed (`Async.AwaitTask` plus `Async.Catch`, mapped to `Result`). Do not use `TrySetException` anywhere else, and never as a replacement for returning `Result`.
+  ```fsharp
+  // producer side, inside the callback boundary
   try
       activity.StartActivityForResult(intent, REQUEST_CODE)
   with
   | ex ->
       tcs.TrySetException(ex) |> ignore<bool>
+
+  // consumer side: the exception is converted to a Result here
+  let private awaitActivityResult (tcs : TaskCompletionSource<ActivityResult>) : Impure<Async<Result<ActivityResult, ActivityError>>> =
+
+      Impure (fun () ->
+
+          async
+              {
+                  let! outcome = tcs.Task |> Async.AwaitTask |> Async.Catch
+
+                  match outcome with
+                  | Choice1Of2 value
+                      ->
+                      return Ok value
+
+                  | Choice2Of2 ex
+                      ->
+                      return Error (StartActivityFailed ex.Message)
+              }
+      )
   ```
-  `try/with` at an interop boundary is correct and expected. It is not a violation of "no exception-based flow." The violation would be letting that exception propagate as control flow *into* pure application code instead of converting it to a `Result`/`Option`/`TrySetException` at the seam.
 - **Nulls from .NET/Android are converted to `Option` at the boundary with `Option.ofNull'`**, used consistently for all nullable .NET types (reference types and `Nullable<T>`) instead of `Option.ofObj`, `Option.ofNull`, `Option.ofNullable`. If a `Nullable<T>` is passed, the wrapper is preserved inside `Some` and causes a type mismatch downstream. This is intentional: it signals that `Option.ofNullable` is needed there.
 
   `Option.ofNull'` is **not** part of FSharp.Core or FsToolkit. It is this project's own helper, defined as follows (do not redefine it, do not replace it with a different null-check):
@@ -281,10 +316,14 @@ let internal execute dispatch (token : CancellationToken) =
 
 Generated code that looks fine can still hide serious problems, and the human reviewer should not have to find them alone.
 
+- **Prior art before design.** For a non-trivial new component (not for every function), check what already exists before inventing something: the project's own helpers (§3, §4), FSharp.Core, FsToolkit.ErrorHandling, the preferred libraries (§5), and established algorithms and patterns. Give a short comparison of the realistic options and pick one, with a reason.
+  - **Cite only what you actually retrieved** in this session. Anything recalled from memory must be labelled "from memory, unverified". Never invent references, citations, library features, or API behavior.
+  - **Translate, don't copy.** Re-express ideas from other ecosystems in this project's style (no classes, `Impure`, `Option`/`Result`, `match`, no `if`/loops). Research must not become a backdoor for patterns this file bans.
+  - **No silent new dependencies.** If the research points to a library outside the preferred list (§5), surface it as a decision for the human. Do not add it.
 - **Self-review pass before presenting code.** After writing any non-trivial code (more than a few lines), re-read it once against this file before showing it. Check at least for:
   - `if...then...else`, `for`/`while`, LINQ or query expressions
   - `.Value`, `Option.get`, other partial functions (§3), `failwith`/`raise`
-  - nulls, `[<AllowNullLiteral>]`, `Nullable<T>`, and nulls or exceptions leaking past a boundary
+  - nulls, `[<AllowNullLiteral>]`, `Nullable<T>`, and nulls or exceptions leaking past a boundary (including `TrySetException` used as final handling instead of as a `Task` bridge)
   - an impure public/internal/private function without `Impure`, or a use of `IO`/`runIO`
   - bare `ignore`, `%A` (including implicit via `string`/`%O`/interpolation on records, unions, exceptions)
   - classes, members, mutability outside an interop boundary
@@ -303,7 +342,8 @@ Generated code that looks fine can still hide serious problems, and the human re
 
 - Functional-only: no classes/interfaces/inheritance, no mutable state, except at .NET/Android/framework interop boundaries; keep that surface thin, delegate into functional code immediately. Functions, not members; data separate from operations.
 - Control flow: `match`/active patterns, never `if...then...else` (incl. boolean branches; match tuples of bools). No `for`/`while`, no LINQ/query exprs; use map/iter/fold or tail-recursion/CPS with accumulator.
-- Errors are values: use `Result`/`Option` (`result{}`, `option{}`, `asyncResult{}`, `asyncOption{}`), no raised exceptions. Convert exceptions/nulls to `Result`/`Option` at any .NET/Android boundary (try/with there is correct) using the project's `Option.ofNull'`; never let them leak into pure code.
+- Errors are values: use `Result`/`Option` (`result{}`, `option{}`, `asyncResult{}`, `asyncOption{}`), no raised exceptions. At any .NET/Android boundary, wrap the call in `try/with` (correct there), convert the exception to `Result` and nulls to `Option` with the project's `Option.ofNull'`, and return `Impure<Result<...>>`; never let exceptions or nulls leak into pure code.
+- `TaskCompletionSource.TrySetException` is only a bridge for unavoidable `Task`/callback interop, never final error handling: convert to `Result` where the `Task` is awaited (`Async.AwaitTask` + `Async.Catch`). Do not use it anywhere else.
 - No partial functions (`List.head`, `List.item`, `List.find`, `Map.find`, `Seq.exactlyOne`, indexers `xs.[i]`, `failwith`, `Option.get`, throwing parsers): use `tryHead`/`tryItem`/`tryFind`/`tryFindIndex`/`tryPick`/`Map.tryFind`/`TryParse` or pattern matching (table in §3).
 - Never introduce nulls, `[<AllowNullLiteral>]`, `Nullable<T>`, `.Value` or `Option.get` on `Option`.
 - No reflection; no `%A` in production (incl. implicit via `string`/`%O`/interpolation on records, unions, exceptions). Thoth explicit decoders only, never `Auto`.
@@ -317,6 +357,7 @@ Generated code that looks fine can still hide serious problems, and the human re
 - Recursion only when collection functions can't do the job; must be tail-recursive/CPS-compliant, or explicitly justified as safely bounded. Avoid `and` except for one inseparable mutually recursive algorithm.
 - Don't split a single logical unit (incl. one complete MVU per UI component) across files.
 - No ORMs; parameterised plain SQL or SQL type providers. PBT for pure functions, no tautological tests. No FSharpPlus/advanced FP in production.
+- Before designing a non-trivial new component, check prior art (own helpers, FSharp.Core, preferred libraries); cite only what you actually retrieved, translate ideas into this style, and never add a new dependency without asking (§14).
 - Before presenting non-trivial code: do a self-review pass against these rules (§14) and report remaining deviations explicitly.
 - Never claim code works, compiles, is tested or is safe unless you actually compiled/ran it; end non-trivial responses with what was not verified.
 - Formatting: one match case per line, `->` often on its own indented line; don't compact to inline match expressions.
